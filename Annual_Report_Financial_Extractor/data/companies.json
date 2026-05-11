@@ -1,0 +1,12 @@
+[
+  {"name": "Reliance Industries", "ticker": "RELIANCE", "sector": "Energy"},
+  {"name": "Infosys", "ticker": "INFY", "sector": "Information Technology"},
+  {"name": "HDFC Bank", "ticker": "HDFCBANK", "sector": "Banking"},
+  {"name": "Tata Motors", "ticker": "TATAMOTORS", "sector": "Automobiles"},
+  {"name": "Sun Pharma", "ticker": "SUNPHARMA", "sector": "Pharmaceuticals"},
+  {"name": "Hindustan Unilever", "ticker": "HINDUNILVR", "sector": "FMCG"},
+  {"name": "Bharti Airtel", "ticker": "BHARTIARTL", "sector": "Telecommunications"},
+  {"name": "Asian Paints", "ticker": "ASIANPAINT", "sector": "Chemicals"},
+  {"name": "LTIMindtree", "ticker": "LTIM", "sector": "Information Technology"},
+  {"name": "Adani Enterprises", "ticker": "ADANIENT", "sector": "Conglomerate"}
+]
