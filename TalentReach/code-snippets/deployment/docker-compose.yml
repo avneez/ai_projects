@@ -1,0 +1,384 @@
+version: '3.8'
+
+# TalenReach.ai - Complete Stack Deployment
+#
+# Services (12 total):
+# 1. PostgreSQL (candidate/job data)
+# 2. Redis (cache + Celery broker + LangGraph checkpoints)
+# 3. RabbitMQ (Celery broker alternative)
+# 4. Neo4j (knowledge graph)
+# 5. Kafka + Zookeeper (event streaming)
+# 6. TimescaleDB (analytics)
+# 7. Airflow (workflow orchestration)
+# 8. Celery Workers (task processing)
+# 9. vLLM Server (LLM inference)
+# 10. FastAPI (REST + WebSocket API)
+# 11. Prometheus + Grafana (monitoring)
+# 12. Jaeger (distributed tracing)
+
+services:
+  # ===== DATABASES =====
+
+  postgres:
+    image: postgres:15
+    container_name: talenreach-postgres
+    environment:
+      POSTGRES_DB: talenreach
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_scripts/postgres_schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - talenreach-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d talenreach"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: talenreach-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - talenreach-network
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5
+    container_name: talenreach-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/password123
+      NEO4J_dbms_memory_pagecache_size: 1G
+      NEO4J_dbms_memory_heap_max__size: 2G
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    volumes:
+      - neo4j_data:/data
+    networks:
+      - talenreach-network
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: talenreach-timescaledb
+    environment:
+      POSTGRES_DB: analytics
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password123
+    ports:
+      - "5433:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    networks:
+      - talenreach-network
+
+  # ===== MESSAGE QUEUES =====
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: talenreach-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: password123
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - talenreach-network
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: talenreach-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - talenreach-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: talenreach-kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    networks:
+      - talenreach-network
+    healthcheck:
+      test: kafka-topics --bootstrap-server localhost:9092 --list
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ===== ORCHESTRATION =====
+
+  airflow-webserver:
+    image: apache/airflow:2.7.0
+    container_name: talenreach-airflow-webserver
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://admin:password123@postgres/talenreach
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://admin:password123@postgres/talenreach
+      AIRFLOW__CORE__FERNET_KEY: 'YOUR_FERNET_KEY_HERE'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'YOUR_SECRET_KEY_HERE'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    ports:
+      - "8080:8080"
+    networks:
+      - talenreach-network
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    image: apache/airflow:2.7.0
+    container_name: talenreach-airflow-scheduler
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://admin:password123@postgres/talenreach
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://admin:password123@postgres/talenreach
+      AIRFLOW__CORE__FERNET_KEY: 'YOUR_FERNET_KEY_HERE'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    networks:
+      - talenreach-network
+    command: scheduler
+
+  # ===== CELERY WORKERS =====
+
+  celery-scraper-worker:
+    build:
+      context: ../
+      dockerfile: code-snippets/deployment/Dockerfile.celery
+    container_name: talenreach-celery-scraper
+    depends_on:
+      - rabbitmq
+      - postgres
+      - redis
+    environment:
+      CELERY_BROKER_URL: amqp://admin:password123@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      DATABASE_URL: postgresql://admin:password123@postgres:5432/talenreach
+    volumes:
+      - ../code-snippets:/app/code-snippets
+    networks:
+      - talenreach-network
+    command: celery -A celery_tasks worker --queue=scraping --concurrency=8 --loglevel=info
+
+  celery-ml-worker:
+    build:
+      context: ../
+      dockerfile: code-snippets/deployment/Dockerfile.celery
+    container_name: talenreach-celery-ml
+    depends_on:
+      - rabbitmq
+      - postgres
+      - redis
+    environment:
+      CELERY_BROKER_URL: amqp://admin:password123@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      DATABASE_URL: postgresql://admin:password123@postgres:5432/talenreach
+    volumes:
+      - ../code-snippets:/app/code-snippets
+    networks:
+      - talenreach-network
+    command: celery -A celery_tasks worker --queue=ml_processing --concurrency=4 --loglevel=info
+
+  celery-flower:
+    image: mher/flower:2.0
+    container_name: talenreach-flower
+    depends_on:
+      - rabbitmq
+      - redis
+    environment:
+      CELERY_BROKER_URL: amqp://admin:password123@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    ports:
+      - "5555:5555"
+    networks:
+      - talenreach-network
+
+  # ===== LLM INFERENCE =====
+
+  vllm-matching:
+    image: vllm/vllm-openai:latest
+    container_name: talenreach-vllm-matching
+    environment:
+      HF_TOKEN: ${HUGGINGFACE_TOKEN}
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./models:/models
+    networks:
+      - talenreach-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 4  # 4 GPUs for Llama 70B tensor parallelism
+              capabilities: [gpu]
+    command: >
+      --model /models/llama-3.3-70b-lora-matching
+      --tensor-parallel-size 4
+      --enable-lora
+      --max-lora-rank 16
+      --port 8000
+
+  vllm-intent:
+    image: vllm/vllm-openai:latest
+    container_name: talenreach-vllm-intent
+    environment:
+      HF_TOKEN: ${HUGGINGFACE_TOKEN}
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./models:/models
+    networks:
+      - talenreach-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1  # Single GPU for Llama 8B
+              capabilities: [gpu]
+    command: >
+      --model /models/llama-3.1-8b-qlora-intent
+      --load-in-4bit
+      --port 8000
+
+  # ===== API LAYER =====
+
+  fastapi:
+    build:
+      context: ../
+      dockerfile: code-snippets/deployment/Dockerfile.api
+    container_name: talenreach-api
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+    environment:
+      DATABASE_URL: postgresql://admin:password123@postgres:5432/talenreach
+      REDIS_URL: redis://redis:6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      VLLM_MATCHING_URL: http://vllm-matching:8000
+      VLLM_INTENT_URL: http://vllm-intent:8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../code-snippets:/app/code-snippets
+    networks:
+      - talenreach-network
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ===== MONITORING =====
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: talenreach-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - talenreach-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: talenreach-grafana
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: false
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - grafana_data:/var/lib/grafana
+    networks:
+      - talenreach-network
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: talenreach-jaeger
+    environment:
+      COLLECTOR_ZIPKIN_HOST_PORT: :9411
+    ports:
+      - "5775:5775/udp"
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+      - "5778:5778"
+      - "16686:16686"  # UI
+      - "14268:14268"
+      - "14250:14250"
+      - "9411:9411"
+    networks:
+      - talenreach-network
+
+networks:
+  talenreach-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  neo4j_data:
+  timescaledb_data:
+  rabbitmq_data:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,548 @@
+version: '3.8'
+
+# AI-Powered Trading System - Docker Compose Configuration
+# This file orchestrates all microservices for local development and testing
+
+services:
+  # ============ DATABASES ============
+
+  # TimescaleDB - Time-series data for OHLCV
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: timescaledb
+    environment:
+      POSTGRES_DB: trading
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # PostgreSQL - Relational data (trades, users, etc.)
+  postgres:
+    image: postgres:14
+    container_name: postgres
+    environment:
+      POSTGRES_DB: trading_meta
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # Redis - Pub/sub, caching, deduplication, Celery broker
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # RabbitMQ - Message broker for Celery (alternative to Redis)
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"   # AMQP port
+      - "15672:15672" # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    restart: unless-stopped
+
+  # Milvus - Vector database for news embeddings
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: milvus-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: 1000
+      ETCD_QUOTA_BACKEND_BYTES: 4294967296
+    volumes:
+      - milvus_etcd:/etcd
+    restart: unless-stopped
+
+  milvus-minio:
+    image: minio/minio:latest
+    container_name: milvus-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - milvus_minio:/minio_data
+    command: minio server /minio_data
+    restart: unless-stopped
+
+  milvus-standalone:
+    image: milvusdb/milvus:latest
+    container_name: milvus-standalone
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      - milvus-etcd
+      - milvus-minio
+    restart: unless-stopped
+
+  # ============ MESSAGE QUEUE ============
+
+  # Kafka - Message broker (alternative: use Redis Streams for simpler setup)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    restart: unless-stopped
+
+  # ============ MONITORING ============
+
+  # Prometheus - Metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+
+  # Grafana - Metrics visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ============ APPLICATION SERVICES ============
+
+  # vLLM - LLM Inference Server
+  # Note: Requires GPU, use --gpus all flag when running docker-compose
+  vllm-server:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-server
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL=meta-llama/Llama-3.1-8B-Instruct
+      - TENSOR_PARALLEL_SIZE=1
+      - GPU_MEMORY_UTILIZATION=0.9
+    restart: unless-stopped
+
+  # Data Ingestion Services
+  twitter-stream:
+    build:
+      context: ./code-snippets/data_ingestion
+      dockerfile: Dockerfile
+    container_name: twitter-stream
+    environment:
+      TWITTER_BEARER_TOKEN: ${TWITTER_BEARER_TOKEN}
+      REDIS_HOST: redis
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      - redis
+      - kafka
+    restart: unless-stopped
+
+  # News Validation Service
+  news-validator:
+    build:
+      context: ./code-snippets/news_processing
+      dockerfile: Dockerfile
+    container_name: news-validator
+    environment:
+      REDIS_HOST: redis
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MODEL_NAME: ProsusAI/finbert
+    depends_on:
+      - redis
+      - kafka
+    restart: unless-stopped
+
+  # Embedding Generator
+  embedding-generator:
+    build:
+      context: ./code-snippets/news_processing
+      dockerfile: Dockerfile.embeddings
+    container_name: embedding-generator
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MILVUS_HOST: milvus-standalone
+    depends_on:
+      - kafka
+      - milvus-standalone
+    restart: unless-stopped
+
+  # Market Data Consumer
+  market-data:
+    build:
+      context: ./code-snippets/data_ingestion
+      dockerfile: Dockerfile.market
+    container_name: market-data
+    environment:
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+      TIMESCALE_HOST: timescaledb
+      REDIS_HOST: redis
+    depends_on:
+      - timescaledb
+      - redis
+    restart: unless-stopped
+
+  # Price Movement Detector
+  price-detector:
+    build:
+      context: ./code-snippets/prediction
+      dockerfile: Dockerfile.detector
+    container_name: price-detector
+    environment:
+      REDIS_HOST: redis
+      TIMESCALE_HOST: timescaledb
+    depends_on:
+      - redis
+      - timescaledb
+    restart: unless-stopped
+
+  # RAG Service (wrapped by LangGraph)
+  rag-service:
+    build:
+      context: ./code-snippets/rag_llm
+      dockerfile: Dockerfile
+    container_name: rag-service
+    environment:
+      MILVUS_HOST: milvus-standalone
+      VLLM_HOST: vllm-server:8000
+      REDIS_HOST: redis
+    ports:
+      - "8001:8001"
+    depends_on:
+      - milvus-standalone
+      - vllm-server
+      - redis
+    restart: unless-stopped
+
+  # LangGraph State Machine Service - Adaptive RAG
+  langgraph-rag:
+    build:
+      context: ./code-snippets/langgraph
+      dockerfile: Dockerfile.rag
+    container_name: langgraph-rag
+    environment:
+      REDIS_HOST: redis
+      REDIS_STATE_DB: 3  # Dedicated DB for LangGraph state
+      MILVUS_HOST: milvus-standalone
+      VLLM_HOST: vllm-server:8000
+    ports:
+      - "8003:8003"
+    depends_on:
+      - redis
+      - milvus-standalone
+      - vllm-server
+      - rag-service
+    restart: unless-stopped
+
+  # Prediction Service (wrapped by LangGraph)
+  prediction-service:
+    build:
+      context: ./code-snippets/prediction
+      dockerfile: Dockerfile
+    container_name: prediction-service
+    environment:
+      TIMESCALE_HOST: timescaledb
+      RAG_SERVICE_URL: http://langgraph-rag:8003  # Use LangGraph RAG
+      REDIS_HOST: redis
+    depends_on:
+      - timescaledb
+      - langgraph-rag
+      - redis
+    restart: unless-stopped
+
+  # LangGraph State Machine Service - Prediction Pipeline
+  langgraph-prediction:
+    build:
+      context: ./code-snippets/langgraph
+      dockerfile: Dockerfile.prediction
+    container_name: langgraph-prediction
+    environment:
+      REDIS_HOST: redis
+      REDIS_STATE_DB: 4  # Dedicated DB for prediction state
+      TIMESCALE_HOST: timescaledb
+      LANGGRAPH_RAG_URL: http://langgraph-rag:8003
+      VLLM_HOST: vllm-server:8000
+    ports:
+      - "8004:8004"
+    depends_on:
+      - redis
+      - timescaledb
+      - langgraph-rag
+      - vllm-server
+    restart: unless-stopped
+
+  # Trade Executor (horizontally scalable)
+  trade-executor-1:
+    build:
+      context: ./code-snippets/execution
+      dockerfile: Dockerfile
+    container_name: trade-executor-1
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+      EXECUTOR_ID: executor-1
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  trade-executor-2:
+    build:
+      context: ./code-snippets/execution
+      dockerfile: Dockerfile
+    container_name: trade-executor-2
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+      EXECUTOR_ID: executor-2
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  # Chatbot Service (LangGraph with conversation memory)
+  chatbot-api:
+    build:
+      context: ./code-snippets/langgraph
+      dockerfile: Dockerfile.chatbot
+    container_name: chatbot-api
+    ports:
+      - "8002:8002"
+    environment:
+      MILVUS_HOST: milvus-standalone
+      VLLM_HOST: vllm-server:8000
+      REDIS_HOST: redis
+      REDIS_STATE_DB: 5  # Dedicated DB for chat conversation memory
+      SQLITE_DB_PATH: /data/chat_memory.db  # Persistent conversation history
+    volumes:
+      - chatbot_memory:/data
+    depends_on:
+      - milvus-standalone
+      - vllm-server
+      - redis
+    restart: unless-stopped
+
+  # ============ WORKFLOW ORCHESTRATION ============
+
+  # Airflow PostgreSQL database
+  airflow-db:
+    image: postgres:14
+    container_name: airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # Airflow Webserver
+  airflow-webserver:
+    image: apache/airflow:2.7.3
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/2
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    depends_on:
+      - airflow-db
+      - redis
+    restart: unless-stopped
+
+  # Airflow Scheduler
+  airflow-scheduler:
+    image: apache/airflow:2.7.3
+    container_name: airflow-scheduler
+    command: scheduler
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/2
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    depends_on:
+      - airflow-db
+      - redis
+    restart: unless-stopped
+
+  # ============ CELERY WORKERS ============
+
+  # Celery Worker - Data Ingestion (high concurrency)
+  celery-worker-ingestion:
+    build:
+      context: ./code-snippets
+      dockerfile: Dockerfile.celery
+    container_name: celery-worker-ingestion
+    command: celery -A tasks worker --queue=data_ingestion --concurrency=16 --loglevel=info
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+      TWITTER_BEARER_TOKEN: ${TWITTER_BEARER_TOKEN}
+      LINKEDIN_API_KEY: ${LINKEDIN_API_KEY}
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  # Celery Worker - ML Processing (CPU-intensive)
+  celery-worker-ml:
+    build:
+      context: ./code-snippets
+      dockerfile: Dockerfile.celery
+    container_name: celery-worker-ml
+    command: celery -A tasks worker --queue=ml_processing --concurrency=4 --loglevel=info
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      REDIS_HOST: redis
+      MILVUS_HOST: milvus-standalone
+    depends_on:
+      - redis
+      - milvus-standalone
+    restart: unless-stopped
+
+  # Celery Worker - Feature Engineering
+  celery-worker-features:
+    build:
+      context: ./code-snippets
+      dockerfile: Dockerfile.celery
+    container_name: celery-worker-features
+    command: celery -A tasks worker --queue=feature_engineering --concurrency=8 --loglevel=info
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      TIMESCALE_HOST: timescaledb
+    depends_on:
+      - redis
+      - timescaledb
+    restart: unless-stopped
+
+  # Celery Worker - GPU Tasks (GNN)
+  celery-worker-gpu:
+    build:
+      context: ./code-snippets
+      dockerfile: Dockerfile.celery-gpu
+    container_name: celery-worker-gpu
+    command: celery -A tasks worker --queue=gpu_tasks --concurrency=1 --loglevel=info
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      NEO4J_HOST: neo4j
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  # Flower - Celery Monitoring Dashboard
+  flower:
+    image: mher/flower:latest
+    container_name: flower
+    command: celery --broker=redis://redis:6379/0 flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  timescale_data:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  milvus_etcd:
+  milvus_minio:
+  milvus_data:
+  prometheus_data:
+  grafana_data:
+  airflow_db:
+  chatbot_memory:  # LangGraph conversation memory
+
+networks:
+  default:
+    name: trading-network
